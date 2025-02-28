@@ -169,6 +169,17 @@ void Feature::cost(const Eigen::Isometry3d& T_c0_ci,
     const Eigen::Vector3d& x, const Eigen::Vector2d& z,
     double& e) const {
   // Compute hi1, hi2, and hi3 as Equation (37).
+  // Pc0 = R_c0_ci * Pci + t_c0_ci          rho = 1/depth
+  // 
+  //         alpha
+  // 1/rho * beta = Rc0_ci * Pci + t_c0_ci = m
+  //          1
+
+  // Pci = R_c0_ci^T * (m - t_c0_ci)
+  // 左右同乘以 rho 则对应代码的 h， 就是旋转感觉不对劲
+
+
+  // 三维坐标 逆深度表示  
   const double& alpha = x(0);
   const double& beta = x(1);
   const double& rho = x(2);
@@ -180,6 +191,7 @@ void Feature::cost(const Eigen::Isometry3d& T_c0_ci,
   double& h3 = h(2);
 
   // Predict the feature observation in ci frame.
+  // 预测特征在 ci 坐标系系下的坐标
   Eigen::Vector2d z_hat(h1/h3, h2/h3);
 
   // Compute the residual.
@@ -193,6 +205,7 @@ void Feature::jacobian(const Eigen::Isometry3d& T_c0_ci,
     double& w) const {
 
   // Compute hi1, hi2, and hi3 as Equation (37).
+  // 逆深度坐标
   const double& alpha = x(0);
   const double& beta = x(1);
   const double& rho = x(2);
@@ -208,6 +221,7 @@ void Feature::jacobian(const Eigen::Isometry3d& T_c0_ci,
   W.leftCols<2>() = T_c0_ci.linear().leftCols<2>();
   W.rightCols<1>() = T_c0_ci.translation();
 
+  // 二维的误差alpha、beta 和 rho 的偏导数
   J.row(0) = 1/h3*W.row(0) - h1/(h3*h3)*W.row(2);
   J.row(1) = 1/h3*W.row(1) - h2/(h3*h3)*W.row(2);
 
@@ -225,11 +239,17 @@ void Feature::jacobian(const Eigen::Isometry3d& T_c0_ci,
   return;
 }
 
+// 通过两帧估算特征点的深度
 void Feature::generateInitialGuess(
     const Eigen::Isometry3d& T_c1_c2, const Eigen::Vector2d& z1,
     const Eigen::Vector2d& z2, Eigen::Vector3d& p) const {
   // Construct a least square problem to solve the depth.
+  // 转到c2
   Eigen::Vector3d m = T_c1_c2.linear() * Eigen::Vector3d(z1(0), z1(1), 1.0);
+  //    u2                u1   t0
+  // Z2 v2  = R_c2_c1 * d v1 + t1
+  //    1                  1   t2
+  // 以上为世界坐标从c1转到c2，代码把R_c2_c1*(u1,v1,1)记作m，方面后面计算
 
   Eigen::Vector2d A(0.0, 0.0);
   A(0) = m(0) - z2(0)*m(2);
@@ -247,6 +267,8 @@ void Feature::generateInitialGuess(
   return;
 }
 
+// 通过比较特征点首次和最后一次被观测时相机的位姿，计算相机在这两个时刻之间的平移
+// 并将平移分解为与特征点方向平行和垂直的分量
 bool Feature::checkMotion(
     const CamStateServer& cam_states) const {
 
@@ -269,9 +291,10 @@ bool Feature::checkMotion(
   // This direction is represented in the world frame.
   Eigen::Vector3d feature_direction(
       observations.begin()->second(0),
-      observations.begin()->second(1), 1.0);
+      observations.begin()->second(1), 
+      1.0);
   feature_direction = feature_direction / feature_direction.norm();
-  feature_direction = first_cam_pose.linear()*feature_direction;
+  feature_direction = first_cam_pose.linear()*feature_direction; //旋转转到世界系
 
   // Compute the translation between the first frame
   // and the last frame. We assume the first frame and
@@ -279,6 +302,7 @@ bool Feature::checkMotion(
   // speed up the checking process.
   Eigen::Vector3d translation = last_cam_pose.translation() -
     first_cam_pose.translation();
+  // 在特征点方向上的投影长度
   double parallel_translation =
     translation.transpose()*feature_direction;
   Eigen::Vector3d orthogonal_translation = translation -
@@ -298,6 +322,7 @@ bool Feature::initializePosition(
   std::vector<Eigen::Vector2d,
     Eigen::aligned_allocator<Eigen::Vector2d> > measurements(0);
 
+  // 特征点像素坐标和左右目相机位姿
   for (auto& m : observations) {
     // TODO: This should be handled properly. Normally, the
     //    required camera states should all be available in
@@ -306,6 +331,7 @@ bool Feature::initializePosition(
     if (cam_state_iter == cam_states.end()) continue;
 
     // Add the measurement.
+    // 特征在左右目的像素坐标
     measurements.push_back(m.second.head<2>());
     measurements.push_back(m.second.tail<2>());
 
@@ -319,6 +345,7 @@ bool Feature::initializePosition(
     Eigen::Isometry3d cam1_pose;
     cam1_pose = cam0_pose * CAMState::T_cam0_cam1.inverse();
 
+    // 相机位置
     cam_poses.push_back(cam0_pose);
     cam_poses.push_back(cam1_pose);
   }
@@ -326,14 +353,17 @@ bool Feature::initializePosition(
   // All camera poses should be modified such that it takes a
   // vector from the first camera frame in the buffer to this
   // camera frame.
+  // 所有相机姿态转换为相对于第一个相机的姿态
   Eigen::Isometry3d T_c0_w = cam_poses[0];
   for (auto& pose : cam_poses)
     pose = pose.inverse() * T_c0_w;
 
   // Generate initial guess
   Eigen::Vector3d initial_position(0.0, 0.0, 0.0);
+  // 估计特征点的3d位置 第一次和最后一次，有足够的激励
   generateInitialGuess(cam_poses[cam_poses.size()-1], measurements[0],
       measurements[measurements.size()-1], initial_position);
+  // 逆深度表示
   Eigen::Vector3d solution(
       initial_position(0)/initial_position(2),
       initial_position(1)/initial_position(2),
@@ -347,6 +377,7 @@ bool Feature::initializePosition(
   double delta_norm = 0;
 
   // Compute the initial cost.
+  // 预测的像素坐标和观测的误差和
   double total_cost = 0.0;
   for (int i = 0; i < cam_poses.size(); ++i) {
     double this_cost = 0.0;
@@ -364,6 +395,7 @@ bool Feature::initializePosition(
       Eigen::Vector2d r;
       double w;
 
+      // 计算误差对 solution（逆深度)的导数，同时考虑权重
       jacobian(cam_poses[i], solution, measurements[i], J, r, w);
 
       if (w == 1) {
@@ -379,6 +411,7 @@ bool Feature::initializePosition(
     // Inner loop.
     // Solve for the delta that can reduce the total cost.
     do {
+      // 求解
       Eigen::Matrix3d damper = lambda * Eigen::Matrix3d::Identity();
       Eigen::Vector3d delta = (A+damper).ldlt().solve(b);
       Eigen::Vector3d new_solution = solution - delta;
@@ -387,10 +420,12 @@ bool Feature::initializePosition(
       double new_cost = 0.0;
       for (int i = 0; i < cam_poses.size(); ++i) {
         double this_cost = 0.0;
+        // 根据求解结果重新算误差
         cost(cam_poses[i], new_solution, measurements[i], this_cost);
         new_cost += this_cost;
       }
 
+      // 误差减小就更新特征点的逆深度表示
       if (new_cost < total_cost) {
         is_cost_reduced = true;
         solution = new_solution;
@@ -412,11 +447,13 @@ bool Feature::initializePosition(
 
   // Covert the feature position from inverse depth
   // representation to its 3d coordinate.
+  // 这里转换成三维坐标
   Eigen::Vector3d final_position(solution(0)/solution(2),
       solution(1)/solution(2), 1.0/solution(2));
 
   // Check if the solution is valid. Make sure the feature
   // is in front of every camera frame observing it.
+  // 特征点z小于0则无效
   bool is_valid_solution = true;
   for (const auto& pose : cam_poses) {
     Eigen::Vector3d position =
@@ -428,6 +465,7 @@ bool Feature::initializePosition(
   }
 
   // Convert the feature position to the world frame.
+  // 转世界写
   position = T_c0_w.linear()*final_position + T_c0_w.translation();
 
   if (is_valid_solution)
